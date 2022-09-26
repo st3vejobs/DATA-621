@@ -1,0 +1,632 @@
+---
+title: "DATA 621 Homework 1"
+author: "Shane Hylton"
+date: "2022-09-25"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+  html_document:
+    toc: yes
+    toc_depth: '3'
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggpubr)
+library(RCurl)
+library(rvest)
+library(GGally)
+library(xgboost)
+library(MASS)
+
+```
+
+
+## Data Exploration
+
+The training data contains the records and team statistics of 2276 teams between the years of 1871 and 2006. Of those 2276 teams, the median record is 82 wins, and the IQR for wins is (71,92). One can assume that the third quartile is enough wins to make the postseason in any given season. The median number of hits in a season is 1454. There are quite a few columns with missing data. If we isolate only the complete seasons with data in all columns, we are left with only 191 complete cases. If we instead begin by removing the TEAM_BATTING_HBP column and then searching for all complete cases, we will be left with 1486 complete cases. This should provide enough information to draw some conclusions. Without knowing the year of each season, it will be difficult to take into account the changes the game has experienced in the last few decades. 
+
+The initial model used for fitting the data showed a strong normal distribution of residuals, as well as a linear normal probability plot. The scatter plot of residuals is evenly distributed above and below the axis. With that being said, the R-Squared is not ideal, so we will need to adjust the model to land on a better fit. Many of the variables are correlated with one another, and the strongest single relationship with team wins is TEAM_BATTING_H, with a correlation of 0.39. 
+
+```{r, echo = FALSE}
+
+mlb_train <- read.csv("https://raw.githubusercontent.com/st3vejobs/DATA-621/main/MLB/moneyball-training-data.csv")
+
+mlb_test <- read.csv("https://raw.githubusercontent.com/st3vejobs/DATA-621/main/MLB/moneyball-evaluation-data.csv")
+
+```
+
+```{r,echo = FALSE}
+
+fit <- lm(TARGET_WINS ~ TEAM_BATTING_H + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_HBP + TEAM_BATTING_SO +  TEAM_BASERUN_SB+ TEAM_BASERUN_CS+ TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO,data = mlb_train)
+
+#summary(fit)
+
+#nrow(mlb_train)
+
+summary(mlb_train)
+
+mlb_trim <- subset(mlb_train, select =  -c(11))
+
+mlb_trim_sub <- drop_na(mlb_trim)
+
+mlb_trim$TEAM_BATTING_SO <- replace_na(mlb_trim$TEAM_BATTING_SO, median(mlb_trim$TEAM_BATTING_SO, na.rm = TRUE))
+
+mlb_trim$TEAM_BASERUN_SB <- replace_na(mlb_trim$TEAM_BASERUN_SB, median(mlb_trim$TEAM_BASERUN_SB, na.rm = TRUE))
+
+mlb_trim$TEAM_BASERUN_CS <- replace_na(mlb_trim$TEAM_BASERUN_CS, median(mlb_trim$TEAM_BASERUN_CS, na.rm = TRUE))
+
+mlb_trim$TEAM_PITCHING_SO <- as.numeric(mlb_trim$TEAM_PITCHING_SO)
+
+mlb_trim$TEAM_PITCHING_SO <- replace_na(mlb_trim$TEAM_PITCHING_SO, median(mlb_trim$TEAM_PITCHING_SO, na.rm = TRUE))
+
+mlb_trim$TEAM_FIELDING_DP <- replace_na(mlb_trim$TEAM_FIELDING_DP, median(mlb_trim$TEAM_FIELDING_DP, na.rm = TRUE))
+
+#summary(mlb_trim)
+
+cor_mat <- data.frame(cor(mlb_trim))
+
+mlb_trim <- subset(mlb_trim, mlb_trim$TEAM_PITCHING_SO <= 1500)
+mlb_trim <- subset(mlb_trim, mlb_trim$TARGET_WINS <= 120)
+mlb_trim <- subset(mlb_trim, mlb_trim$TARGET_WINS >= 20)
+mlb_trim <- subset(mlb_trim, mlb_trim$TEAM_BATTING_HR > 0)
+mlb_trim <- subset(mlb_trim, mlb_trim$TEAM_BATTING_SO > 0)
+mlb_trim <- subset(mlb_trim, mlb_trim$TEAM_PITCHING_SO > 0)
+mlb_trim$TEAM_BATTING_S <- mlb_trim$TEAM_BATTING_H - mlb_trim$TEAM_BATTING_2B - mlb_trim$TEAM_BATTING_3B - mlb_trim$TEAM_BATTING_HR
+
+```
+
+```{r, echo = FALSE}
+
+all_box <- ggplot(mlb_train, aes(y=TARGET_WINS))+
+  geom_boxplot(outlier.color = 'red', outlier.size = 1)+
+  ylab('Target Wins')+
+  ggtitle('Team Wins per Season')+
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+
+complete_box <- ggplot(mlb_trim_sub, aes(y=TARGET_WINS))+
+  geom_boxplot(outlier.color = 'green', outlier.size = 1)+
+  ylab('Target Wins')+
+  ggtitle('Team Wins per Season (Complete Data)')+
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+
+ggarrange(all_box,complete_box)
+
+```
+
+## Data Preparation
+
+Looking at the original dataframe with 2276 entries, one of the main columns that is missing data is the HBP column. Based on the original fit, HBP did not add much to the model, so I will remove that statistic, especially considering how much it is out of the control of the team. Most likely, HBP is not something that can be predicted year over year. It is possible that there is a reasonable means to predict the HBP statistic for an individual, but it is not something that can easily be predicted in this case. I will remove the HBP column entirely because there are only 191 complete entries for the HBP statistic, so it cannot be used as a predictor. The Caught Stealing statistic has 772 NA entries, so I will replace all of the NAs in that statistic with the median. The same will be done for the other few columns that have 800 or fewer NAs. 
+
+I created a ratio for Home Runs per Hit to see if there is any value in finding home run frequency for a given team. I also deconstructed the Hits variable, and in its place I left singles, doubles, triples, and home runs. This will remove the collinearity between hits and the existing doubles, triples, and home runs.
+
+Unrealistic data will be removed as well. For instance, one row shows nearly 20,000 strike outs (MLB Record 1450) and some other rows show a prediction of well above 116 wins, which is the MLB record. 
+
+```{r, echo = FALSE}
+
+fit_res_sct <- ggplot(data = fit, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = 'red') +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Linearity of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+fit_res_hst <- ggplot(data = fit, aes(x = .resid)) +
+  geom_histogram(binwidth = 5) +
+  xlab("Residuals") +
+  ggtitle("Histogram of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+fit_res_npp <- ggplot(data = fit, aes(sample = .resid)) +
+  stat_qq()+
+  ggtitle("Normal Probability Plot of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5, size = 9.5))
+
+lin_analysis <- ggarrange(fit_res_sct, fit_res_hst, fit_res_npp)
+
+#lin_analysis
+
+```
+
+## Build Models
+
+### Model One
+
+For the first model, I will remove unnecessary variables only, and I will seek a collection of variables with p-values of 0.05 or lower. Hits were removed and instead I broke down the hits based on the number of bases gained by each type of hit. I removed hits because there was a concern of colinearity and overlap with the other three types of hit already in the model. I used variables for singles, doubles, triples, and home runs. 
+
+With a p-value of 0.227, TEAM_BASERUN_SB, provides very little to the target variable. Doubles are the only other variable that has a p-value greater than 0.05.
+
+For the original first model, the R-squared is 0.3039, with a standard error of 12.36 on 2207 degrees of freedom, and the fit decent, though the R-squared leaves the door open for error. In the first model, after removing the variables that had p-values above 0.05, the R-squared decreased to 0.3018 with a standard error of 12.37 on 2210 degrees of freedom. 
+
+The intercept of 29.44 games provides a baseline number that represents the amount of wins a team should be expected to have, and the expected wins can increase or decrease from that mark. All hit types and walks add to the wins column, while strikeouts detract from wins. Stolen bases add to wins, as do pitching strike outs. Contrary to expectations, fielding double plays detract from a team's expected win total. Errors, allowed walks, and allowed home runs all also detract from expected wins.
+
+```{r, echo = FALSE}
+
+mlb_trim$HR_H <- mlb_trim$TEAM_BATTING_HR / mlb_trim$TEAM_BATTING_H
+
+fit_2 <- lm(TARGET_WINS ~ TEAM_BATTING_S + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_BASERUN_CS + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO + HR_H,data = mlb_trim)
+
+#summary(fit_2)
+
+fit_2_update <- lm(TARGET_WINS ~ TEAM_BATTING_S + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO,data = mlb_trim)
+
+#summary(fit_2_update)
+
+```
+
+### Model Two
+
+For the second model, I used the Box-Cox method to find a lambda that is appropriate for the model. The R-squared of that model was 0.3012, and the standard error was 0.411 with 2210 degrees of freedom. While the R-squared is lower than the first model, the standard error is substantially lower. 
+
+The baseline expected wins for the Box-Cox model is 42.5. All types of hits add to the wins, as do walks and stolen bases.Strikeouts detract from potential wins. Fielding double plays again detract from the expected win total, which is certainly contrary to expectations. Errors, allowed walks, and allowed home runs all detract from win total. 
+
+
+
+```{r, echo = FALSE}
+
+mlb_mod <- mlb_trim
+#mlb_mod$TEAM_BATTING_2B <- mlb_mod$TEAM_BATTING_2B / 2 
+#mlb_mod$TEAM_BATTING_3B <- mlb_mod$TEAM_BATTING_3B * .75 
+#mlb_mod$TEAM_BATTING_HR <- mlb_mod$TEAM_BATTING_HR * 100
+#mlb_mod$HR_H <- mlb_mod$HR_H * 3
+#mlb_mod$TEAM_FIELDING_E <- mlb_mod$TEAM_FIELDING_E * 3
+
+fit_3 <- lm(TARGET_WINS ~ TEAM_BATTING_H + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB+ TEAM_BASERUN_CS+ TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO + HR_H,data = mlb_mod)
+
+#summary(fit_3)
+
+bc <- boxcox(fit_3)
+lam <- bc$x[which.max(bc$y)]
+
+fit_3_bc <- lm((TARGET_WINS^(lam - 1))/lam ~ TEAM_BATTING_S + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO,data = mlb_mod)
+
+#summary(fit_3_bc)
+
+```
+
+### Model Three
+
+For the third model, I manipulated the predictor variables to come up with a model that contains variables with magnitudes that are more comparable to one another. I started by taking the log of each predictor variable. 
+
+The third model was then created using the backwards selection method after taking the log of each variable. The resulting R-squared was 0.2935, and the standard error was 12.45 on 2209 degrees of freedom. 
+
+The intercept on this model is not as intuitive, because the coefficients have very high magnitudes. The intercept, or the baseline for wins is -326. One single adds 60 to that tally, so it is very easy to overcome the negative value to start. This model agrees with the other two in the ways that each statistic adds or detracts from win total. Batter strikeouts and baserunners being caught stealing both detract from the expected win total. Errors, Allowed Home Runs, and double plays all detract from win total. Allowed walks actually add to the win total in this model, which is also confusing. 
+
+```{r, echo = FALSE}
+
+mod_ln <- mlb_trim
+mod_ln <- subset(mlb_trim, select = -c(1,2,17))
+mod_ln$TEAM_BATTING_S <- mod_ln$TEAM_BATTING_H - mod_ln$TEAM_BATTING_2B - mod_ln$TEAM_BATTING_3B - mod_ln$TEAM_BATTING_HR
+mod_ln <- log((mod_ln))
+
+mod_ln$TARGET_WINS <- mlb_trim$TARGET_WINS
+mod_ln$HR_H <- mlb_trim$HR_H
+
+fit_4 <- lm(TARGET_WINS ~ TEAM_BATTING_H + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_BASERUN_CS + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO + HR_H + TEAM_BATTING_S,data = mod_ln)
+
+#summary(fit_4)
+
+fit_5 <- lm(TARGET_WINS ~ TEAM_BATTING_S + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_BASERUN_CS + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_HR + TEAM_PITCHING_SO + HR_H + TEAM_BATTING_S,data = mod_ln)
+
+#summary(fit_5)
+```
+
+## Select Models
+
+In the end, the Box-Cox derived model is the most appealing judging by the R-squared coupled with the residual standard error. While it has the lowest R-squared of the three, it has the lowest standard error, which indicates that the residuals are closely distributed around the population mean. It is worth considering, however, that the Box-Cox model was heavily reshaped, so the standard error is actually not as strong as it may appear. 
+
+Visually, the Log Transform with Backwards Selection model looks to be the most normally distributed. The Normal Probability Plot looks to be the most linear of the three, and the histogram of the residuals is reasonably normally distributed. The Box-Cox model looks excellent at times, but it begins to falter when the residuals drop to -2. While the log transformed model appears optimal visually, it is the model that makes the least sense intuitively for the linear equation. 
+
+Though the normal probability plot is not as linear as the other two, the Box-Cox transformed model appears to be the most suitable for the prediction. 
+
+```{r, echo = FALSE}
+
+back_res_sct <- ggplot(data = fit_2_update, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = 'red') +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Linearity of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+back_res_hst <- ggplot(data = fit_2_update, aes(x = .resid)) +
+  geom_histogram(binwidth = 5) +
+  xlab("Residuals") +
+  ggtitle("Histogram of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+back_res_npp <- ggplot(data = fit_2_update, aes(sample = .resid)) +
+  stat_qq()+
+  ggtitle("Normal Probability Plot of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5, size = 9.5))
+
+lin_analysis_back <- ggarrange(back_res_sct,ggarrange(back_res_hst, back_res_npp), nrow = 2)
+
+annotate_figure(lin_analysis_back, top = text_grob("Backwards Selection",color = "red", size = 12))
+
+#lin_analysis_back
+
+```
+
+```{r, echo = FALSE}
+
+bc_res_sct <- ggplot(data = fit_3_bc, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = 'red') +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Linearity of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+bc_res_hst <- ggplot(data = fit_3_bc, aes(x = .resid)) +
+  geom_histogram(binwidth = .25) +
+  xlab("Residuals") +
+  ggtitle("Histogram of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+bc_res_npp <- ggplot(data = fit_3_bc, aes(sample = .resid)) +
+  stat_qq()+
+  ggtitle("Normal Probability Plot of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5, size = 9.5))
+
+lin_analysis_bc <- ggarrange(bc_res_sct,ggarrange(bc_res_hst, bc_res_npp), nrow = 2)
+
+annotate_figure(lin_analysis_bc, top = text_grob("Box-Cox",color = "red", size = 12))
+
+
+```
+
+```{r, echo = FALSE}
+
+log_res_sct <- ggplot(data = fit_5, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = 'red') +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Linearity of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+log_res_hst <- ggplot(data = fit_5, aes(x = .resid)) +
+  geom_histogram(binwidth = 5) +
+  xlab("Residuals") +
+  ggtitle("Histogram of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+log_res_npp <- ggplot(data = fit_5, aes(sample = .resid)) +
+  stat_qq()+
+  ggtitle("Normal Probability Plot of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5, size = 9.5))
+
+lin_analysis_log <- ggarrange(log_res_sct,ggarrange(log_res_hst, log_res_npp), nrow = 2)
+
+annotate_figure(lin_analysis_log, top = text_grob("Log Transform with Backwards Selection",color = "red", size = 12))
+
+#lin_analysis_back
+
+```
+
+
+### Implementation
+
+#### Box-Cox Model Predictions:
+
+
+
+I have exported the predicted win totals for the test data to a .csv file for validation. The Box-Cox approach is the model that I place the most trust in of the three models. 
+
+```{r, echo = FALSE}
+
+mlb_test$TEAM_BATTING_S <- mlb_test$TEAM_BATTING_H - mlb_test$TEAM_BATTING_2B - mlb_test$TEAM_BATTING_3B - mlb_test$TEAM_BATTING_HR
+
+mlb_test$HR_H <- mlb_test$TEAM_BATTING_HR / mlb_test$TEAM_BATTING_H
+
+mlb_test_archive <- mlb_test$INDEX
+rownames(mlb_test) <- mlb_test$INDEX
+
+mlb_test_log <- subset(mlb_test, select = -c(1, 2, 10,18))
+
+na_median <- function(x) replace(x, is.na(x), median(x, na.rm = TRUE))
+
+mlb_test_log <- replace(mlb_test_log, TRUE, lapply(mlb_test_log, na_median))
+mlb_test_test <- mlb_test_log
+mlb_test_test$HR_H <- mlb_test$HR_H
+
+mlb_test_log[mlb_test_log == 0] <- 1
+
+
+
+mlb_test_log <- log(mlb_test_log)
+mlb_test_log$HR_H <- mlb_test$HR_H
+
+
+#predict(fit_5, mlb_test_log)
+
+bc_test <- predict(fit_3_bc, mlb_test_test)
+
+bc_test <- (bc_test*lam)^(1/(lam - 1))
+
+bc_test
+
+write.table(bc_test,"box_cox_prediction_mlb.csv",row.names = TRUE, col.names = FALSE, quote = FALSE, sep = ",")
+
+```
+
+
+## Appendix: Code
+
+```{r, eval = FALSE}
+
+#mlb_train <- read.csv("https://raw.githubusercontent.com/st3vejobs/DATA-621/main/MLB/moneyball-training-data.csv")
+
+#mlb_test <- read.csv("https://raw.githubusercontent.com/st3vejobs/DATA-621/main/MLB/moneyball-evaluation-data.csv")
+
+```
+
+```{r, eval = FALSE}
+
+fit <- lm(TARGET_WINS ~ TEAM_BATTING_H + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_HBP + TEAM_BATTING_SO +  TEAM_BASERUN_SB+ TEAM_BASERUN_CS+ TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO,data = mlb_train)
+
+#summary(fit)
+
+#nrow(mlb_train)
+
+summary(mlb_train)
+
+mlb_trim <- subset(mlb_train, select =  -c(11))
+
+mlb_trim_sub <- drop_na(mlb_trim)
+
+mlb_trim$TEAM_BATTING_SO <- replace_na(mlb_trim$TEAM_BATTING_SO, median(mlb_trim$TEAM_BATTING_SO, na.rm = TRUE))
+
+mlb_trim$TEAM_BASERUN_SB <- replace_na(mlb_trim$TEAM_BASERUN_SB, median(mlb_trim$TEAM_BASERUN_SB, na.rm = TRUE))
+
+mlb_trim$TEAM_BASERUN_CS <- replace_na(mlb_trim$TEAM_BASERUN_CS, median(mlb_trim$TEAM_BASERUN_CS, na.rm = TRUE))
+
+mlb_trim$TEAM_PITCHING_SO <- as.numeric(mlb_trim$TEAM_PITCHING_SO)
+
+mlb_trim$TEAM_PITCHING_SO <- replace_na(mlb_trim$TEAM_PITCHING_SO, median(mlb_trim$TEAM_PITCHING_SO, na.rm = TRUE))
+
+mlb_trim$TEAM_FIELDING_DP <- replace_na(mlb_trim$TEAM_FIELDING_DP, median(mlb_trim$TEAM_FIELDING_DP, na.rm = TRUE))
+
+#summary(mlb_trim)
+
+cor_mat <- data.frame(cor(mlb_trim))
+
+mlb_trim <- subset(mlb_trim, mlb_trim$TEAM_PITCHING_SO <= 1500)
+mlb_trim <- subset(mlb_trim, mlb_trim$TARGET_WINS <= 120)
+mlb_trim <- subset(mlb_trim, mlb_trim$TARGET_WINS >= 20)
+mlb_trim <- subset(mlb_trim, mlb_trim$TEAM_BATTING_HR > 0)
+mlb_trim <- subset(mlb_trim, mlb_trim$TEAM_BATTING_SO > 0)
+mlb_trim <- subset(mlb_trim, mlb_trim$TEAM_PITCHING_SO > 0)
+mlb_trim$TEAM_BATTING_S <- mlb_trim$TEAM_BATTING_H - mlb_trim$TEAM_BATTING_2B - mlb_trim$TEAM_BATTING_3B - mlb_trim$TEAM_BATTING_HR
+
+```
+
+```{r, eval = FALSE}
+
+all_box <- ggplot(mlb_train, aes(y=TARGET_WINS))+
+  geom_boxplot(outlier.color = 'red', outlier.size = 1)+
+  ylab('Target Wins')+
+  ggtitle('Team Wins per Season')+
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+
+complete_box <- ggplot(mlb_trim_sub, aes(y=TARGET_WINS))+
+  geom_boxplot(outlier.color = 'green', outlier.size = 1)+
+  ylab('Target Wins')+
+  ggtitle('Team Wins per Season (Complete Data)')+
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+
+ggarrange(all_box,complete_box)
+
+```
+
+
+```{r, eval = FALSE}
+
+fit_res_sct <- ggplot(data = fit, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = 'red') +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Linearity of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+fit_res_hst <- ggplot(data = fit, aes(x = .resid)) +
+  geom_histogram(binwidth = 5) +
+  xlab("Residuals") +
+  ggtitle("Histogram of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+fit_res_npp <- ggplot(data = fit, aes(sample = .resid)) +
+  stat_qq()+
+  ggtitle("Normal Probability Plot of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5, size = 9.5))
+
+lin_analysis <- ggarrange(fit_res_sct, fit_res_hst, fit_res_npp)
+
+#lin_analysis
+
+```
+
+```{r, eval = FALSE}
+
+mlb_trim$HR_H <- mlb_trim$TEAM_BATTING_HR / mlb_trim$TEAM_BATTING_H
+
+fit_2 <- lm(TARGET_WINS ~ TEAM_BATTING_S + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_BASERUN_CS + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO + HR_H,data = mlb_trim)
+
+#summary(fit_2)
+
+fit_2_update <- lm(TARGET_WINS ~ TEAM_BATTING_S + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO,data = mlb_trim)
+
+#summary(fit_2_update)
+
+```
+
+```{r, eval = FALSE}
+
+mlb_mod <- mlb_trim
+#mlb_mod$TEAM_BATTING_2B <- mlb_mod$TEAM_BATTING_2B / 2 
+#mlb_mod$TEAM_BATTING_3B <- mlb_mod$TEAM_BATTING_3B * .75 
+#mlb_mod$TEAM_BATTING_HR <- mlb_mod$TEAM_BATTING_HR * 100
+#mlb_mod$HR_H <- mlb_mod$HR_H * 3
+#mlb_mod$TEAM_FIELDING_E <- mlb_mod$TEAM_FIELDING_E * 3
+
+fit_3 <- lm(TARGET_WINS ~ TEAM_BATTING_H + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB+ TEAM_BASERUN_CS+ TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO + HR_H,data = mlb_mod)
+
+#summary(fit_3)
+
+bc <- boxcox(fit_3)
+lam <- bc$x[which.max(bc$y)]
+
+fit_3_bc <- lm((TARGET_WINS^(lam - 1))/lam ~ TEAM_BATTING_S + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO,data = mlb_mod)
+
+#summary(fit_3_bc)
+
+```
+
+```{r, eval = FALSE}
+
+mod_ln <- mlb_trim
+mod_ln <- subset(mlb_trim, select = -c(1,2,17))
+mod_ln$TEAM_BATTING_S <- mod_ln$TEAM_BATTING_H - mod_ln$TEAM_BATTING_2B - mod_ln$TEAM_BATTING_3B - mod_ln$TEAM_BATTING_HR
+mod_ln <- log((mod_ln))
+
+mod_ln$TARGET_WINS <- mlb_trim$TARGET_WINS
+mod_ln$HR_H <- mlb_trim$HR_H
+
+fit_4 <- lm(TARGET_WINS ~ TEAM_BATTING_H + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_BB + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_BASERUN_CS + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_H + TEAM_PITCHING_HR + TEAM_PITCHING_SO + HR_H + TEAM_BATTING_S,data = mod_ln)
+
+#summary(fit_4)
+
+fit_5 <- lm(TARGET_WINS ~ TEAM_BATTING_S + TEAM_BATTING_2B + TEAM_BATTING_3B + TEAM_BATTING_HR + TEAM_BATTING_SO +  TEAM_BASERUN_SB + TEAM_BASERUN_CS + TEAM_FIELDING_E + TEAM_FIELDING_DP + TEAM_PITCHING_BB + TEAM_PITCHING_HR + TEAM_PITCHING_SO + HR_H + TEAM_BATTING_S,data = mod_ln)
+
+#summary(fit_5)
+```
+
+```{r, eval = FALSE}
+
+back_res_sct <- ggplot(data = fit_2_update, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = 'red') +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Linearity of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+back_res_hst <- ggplot(data = fit_2_update, aes(x = .resid)) +
+  geom_histogram(binwidth = 5) +
+  xlab("Residuals") +
+  ggtitle("Histogram of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+back_res_npp <- ggplot(data = fit_2_update, aes(sample = .resid)) +
+  stat_qq()+
+  ggtitle("Normal Probability Plot of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5, size = 9.5))
+
+lin_analysis_back <- ggarrange(back_res_sct,ggarrange(back_res_hst, back_res_npp), nrow = 2)
+
+annotate_figure(lin_analysis_back, top = text_grob("Backwards Selection",color = "red", size = 12))
+
+#lin_analysis_back
+
+```
+
+```{r, eval = FALSE}
+
+bc_res_sct <- ggplot(data = fit_3_bc, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = 'red') +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Linearity of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+bc_res_hst <- ggplot(data = fit_3_bc, aes(x = .resid)) +
+  geom_histogram(binwidth = .25) +
+  xlab("Residuals") +
+  ggtitle("Histogram of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+bc_res_npp <- ggplot(data = fit_3_bc, aes(sample = .resid)) +
+  stat_qq()+
+  ggtitle("Normal Probability Plot of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5, size = 9.5))
+
+lin_analysis_bc <- ggarrange(bc_res_sct,ggarrange(bc_res_hst, bc_res_npp), nrow = 2)
+
+annotate_figure(lin_analysis_bc, top = text_grob("Box-Cox",color = "red", size = 12))
+
+
+```
+
+```{r, eval = FALSE}
+
+log_res_sct <- ggplot(data = fit_5, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = 'red') +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Linearity of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+log_res_hst <- ggplot(data = fit_5, aes(x = .resid)) +
+  geom_histogram(binwidth = 5) +
+  xlab("Residuals") +
+  ggtitle("Histogram of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+log_res_npp <- ggplot(data = fit_5, aes(sample = .resid)) +
+  stat_qq()+
+  ggtitle("Normal Probability Plot of Residuals")+
+  theme(plot.title = element_text(hjust = 0.5, size = 9.5))
+
+lin_analysis_log <- ggarrange(log_res_sct,ggarrange(log_res_hst, log_res_npp), nrow = 2)
+
+annotate_figure(lin_analysis_log, top = text_grob("Log Transform with Backwards Selection",color = "red", size = 12))
+
+#lin_analysis_back
+
+```
+
+```{r, eval = FALSE}
+
+mlb_test$TEAM_BATTING_S <- mlb_test$TEAM_BATTING_H - mlb_test$TEAM_BATTING_2B - mlb_test$TEAM_BATTING_3B - mlb_test$TEAM_BATTING_HR
+
+mlb_test$HR_H <- mlb_test$TEAM_BATTING_HR / mlb_test$TEAM_BATTING_H
+
+mlb_test_archive <- mlb_test$INDEX
+rownames(mlb_test) <- mlb_test$INDEX
+
+mlb_test_log <- subset(mlb_test, select = -c(1, 2, 10,18))
+
+na_median <- function(x) replace(x, is.na(x), median(x, na.rm = TRUE))
+
+mlb_test_log <- replace(mlb_test_log, TRUE, lapply(mlb_test_log, na_median))
+mlb_test_test <- mlb_test_log
+mlb_test_test$HR_H <- mlb_test$HR_H
+
+mlb_test_log[mlb_test_log == 0] <- 1
+
+
+
+mlb_test_log <- log(mlb_test_log)
+mlb_test_log$HR_H <- mlb_test$HR_H
+
+
+#predict(fit_5, mlb_test_log)
+
+bc_test <- predict(fit_3_bc, mlb_test_test)
+
+bc_test <- (bc_test*lam)^(1/(lam - 1))
+
+bc_test
+
+write.table(bc_test,"box_cox_prediction_mlb.csv",row.names = TRUE, col.names = FALSE, quote = FALSE, sep = ",")
+
+```
+
